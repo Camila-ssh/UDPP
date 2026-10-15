@@ -1,0 +1,349 @@
+#!/bin/bash
+
+set -e
+
+CONFIG="/etc/hysteria/config.json"
+BACKUP="/etc/hysteria/config.json.bak"
+AUTH_DIR="/etc/hysteria/wakko"
+KEY_FILE="$AUTH_DIR/master-v1.key"
+WHITELIST_FILE="$AUTH_DIR/whitelist"
+AUTH_SCRIPT="/etc/hysteria/wakko-auth-v1.py"
+SERVICE="hysteria-server.service"
+
+SERVER_ID="hy1udp01"
+MAX_AGE="8"
+
+echo
+echo "=========================================="
+echo "  Wakko HY1 - Auth dinámico HMAC"
+echo "=========================================="
+echo
+
+# ---------------------------------------------------------
+# 1. Verificaciones
+# ---------------------------------------------------------
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: Ejecuta este script como root."
+    exit 1
+fi
+
+if [ ! -f "$CONFIG" ]; then
+    echo "ERROR: No existe:"
+    echo "  $CONFIG"
+    exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "Instalando Python 3..."
+    apt-get update
+    apt-get install -y python3
+fi
+
+if ! command -v openssl >/dev/null 2>&1; then
+    echo "Instalando OpenSSL..."
+    apt-get update
+    apt-get install -y openssl
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "Instalando jq..."
+    apt-get update
+    apt-get install -y jq
+fi
+
+echo "[OK] Dependencias verificadas."
+
+# ---------------------------------------------------------
+# 2. Copia de seguridad
+# ---------------------------------------------------------
+
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+BACKUP_REAL="/etc/hysteria/config.json.bak"
+
+cp "$CONFIG" "$BACKUP_REAL"
+
+echo "[OK] Backup creado:"
+echo "  $BACKUP_REAL"
+
+# ---------------------------------------------------------
+# 3. Crear directorio
+# ---------------------------------------------------------
+
+mkdir -p "$AUTH_DIR"
+chmod 700 "$AUTH_DIR"
+
+# ---------------------------------------------------------
+# 4. Generar MASTER_KEY
+# ---------------------------------------------------------
+
+MASTER_KEY="$(openssl rand -hex 32)"
+
+echo "$MASTER_KEY" > "$KEY_FILE"
+
+chmod 600 "$KEY_FILE"
+chown root:root "$KEY_FILE"
+
+echo "[OK] MASTER_KEY generada."
+
+# ---------------------------------------------------------
+# 5. Crear whitelist si no existe
+# ---------------------------------------------------------
+
+if [ ! -f "$WHITELIST_FILE" ]; then
+    touch "$WHITELIST_FILE"
+fi
+
+chmod 600 "$WHITELIST_FILE"
+chown root:root "$WHITELIST_FILE"
+
+echo "[OK] Whitelist preparada:"
+echo "  $WHITELIST_FILE"
+
+# ---------------------------------------------------------
+# 6. Crear validador Python
+# ---------------------------------------------------------
+
+cat > "$AUTH_SCRIPT" <<EOF
+#!/usr/bin/python3
+
+import hashlib
+import hmac
+import re
+import sys
+import time
+
+KEY_FILE = "$KEY_FILE"
+WHITELIST_FILE = "$WHITELIST_FILE"
+SERVER_ID = "$SERVER_ID"
+MAX_AGE = $MAX_AGE
+
+
+def reject(msg):
+    print(msg)
+    sys.exit(1)
+
+
+def is_whitelisted(value):
+    try:
+        with open(WHITELIST_FILE, "r") as f:
+            for line in f:
+
+                item = line.strip()
+
+                if not item:
+                    continue
+
+                if item.startswith("#"):
+                    continue
+
+                if hmac.compare_digest(item, value):
+                    return True
+
+    except Exception:
+        pass
+
+    return False
+
+
+if len(sys.argv) != 5:
+    reject("invalid arguments")
+
+
+addr = sys.argv[1]
+auth = sys.argv[2].strip()
+send = sys.argv[3]
+recv = sys.argv[4]
+
+
+# ---------------------------------------------------------
+# WHITELIST
+# Formato esperado:
+#
+# usuario:contraseña
+#
+# Si coincide exactamente, se acepta sin validar WK1.
+# ---------------------------------------------------------
+
+if is_whitelisted(auth):
+    print("wakko")
+    sys.exit(0)
+
+
+# ---------------------------------------------------------
+# AUTH DINÁMICO WK1
+# ---------------------------------------------------------
+
+parts = auth.split(".")
+
+if len(parts) != 4:
+    reject("invalid token")
+
+
+version, timestamp_s, nonce, signature = parts
+
+
+if version != "WK1":
+    reject("invalid version")
+
+if not timestamp_s.isdigit():
+    reject("invalid timestamp")
+
+if not re.fullmatch(r"[0-9a-f]{32}", nonce):
+    reject("invalid nonce")
+
+if not re.fullmatch(r"[0-9a-f]{64}", signature):
+    reject("invalid signature")
+
+
+timestamp = int(timestamp_s)
+now = int(time.time())
+
+
+if abs(now - timestamp) > MAX_AGE:
+    reject("expired")
+
+
+try:
+    with open(KEY_FILE, "r") as f:
+        key = bytes.fromhex(f.read().strip())
+except Exception:
+    reject("key error")
+
+
+message = (
+    f"{version}|{timestamp}|{nonce}|{SERVER_ID}"
+).encode("utf-8")
+
+
+expected = hmac.new(
+    key,
+    message,
+    hashlib.sha256
+).hexdigest()
+
+
+if not hmac.compare_digest(expected, signature):
+    reject("auth failed")
+
+
+print("wakko")
+sys.exit(0)
+EOF
+
+chmod 755 "$AUTH_SCRIPT"
+chown root:root "$AUTH_SCRIPT"
+
+echo "[OK] Validador instalado:"
+echo "  $AUTH_SCRIPT"
+
+# ---------------------------------------------------------
+# 7. Cambiar auth en config.json
+# ---------------------------------------------------------
+
+TMP_CONFIG="$(mktemp)"
+
+jq '
+.auth = {
+  "mode": "external",
+  "config": {
+    "cmd": "/etc/hysteria/wakko-auth-v1.py"
+  }
+}
+' "$CONFIG" > "$TMP_CONFIG"
+
+jq empty "$TMP_CONFIG"
+
+cp "$TMP_CONFIG" "$CONFIG"
+rm -f "$TMP_CONFIG"
+
+echo "[OK] config.json actualizado a auth external."
+
+# ---------------------------------------------------------
+# 8. Reiniciar servicio
+# ---------------------------------------------------------
+
+echo
+echo "Reiniciando Hysteria..."
+systemctl restart "$SERVICE"
+
+sleep 2
+
+# ---------------------------------------------------------
+# 9. Verificar estado
+# ---------------------------------------------------------
+
+if systemctl is-active --quiet "$SERVICE"; then
+    echo "[OK] Hysteria está activo."
+else
+    echo
+    echo "ERROR: Hysteria no inició correctamente."
+    echo
+    echo "Restaurando configuración anterior..."
+
+    cp "$BACKUP_REAL" "$CONFIG"
+
+    systemctl restart "$SERVICE" || true
+
+    echo
+    echo "Configuración restaurada."
+    echo
+    echo "Últimas líneas del log:"
+    journalctl -u "$SERVICE" -n 30 --no-pager
+
+    exit 1
+fi
+
+# ---------------------------------------------------------
+# 10. Mostrar resultado
+# ---------------------------------------------------------
+
+echo
+echo "=========================================="
+echo " INSTALACIÓN COMPLETADA"
+echo "=========================================="
+echo
+echo "MASTER_KEY:"
+echo
+echo "$MASTER_KEY"
+echo
+echo "Ruta de la clave:"
+echo "  $KEY_FILE"
+echo
+echo "Whitelist:"
+echo "  $WHITELIST_FILE"
+echo
+echo "Servidor ID:"
+echo "  $SERVER_ID"
+echo
+echo "Ventana de autenticación:"
+echo "  $MAX_AGE segundos"
+echo
+echo "Validador:"
+echo "  $AUTH_SCRIPT"
+echo
+echo "Config Hysteria:"
+echo "  $CONFIG"
+echo
+echo "Backup:"
+echo "  $BACKUP_REAL"
+echo
+echo "IMPORTANTE:"
+echo "Usa esta misma MASTER_KEY en HysteriaAuth.java"
+echo "y usa SERVER_ID=\"$SERVER_ID\"."
+echo
+echo "Para ver la clave nuevamente:"
+echo
+echo "  cat $KEY_FILE"
+echo
+echo "Para editar la whitelist:"
+echo
+echo "  nano $WHITELIST_FILE"
+echo
+echo "Formato:"
+echo
+echo "  usuario:contraseña"
+echo
+echo "Estado del servicio:"
+systemctl --no-pager --full status "$SERVICE" | head -n 12
+echo
